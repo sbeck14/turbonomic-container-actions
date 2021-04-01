@@ -10,7 +10,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "axios": "^0.19.2",
+    "axios": "^0.21.1",
     "qs": "^6.9.4",
     "querystring": "^0.2.0",
     "tiny-async-pool": "^1.1.0"

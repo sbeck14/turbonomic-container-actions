@@ -49,9 +49,9 @@ function mapCursors(cursor, totalRecords, fn) {
 
 /**
  * Get all actions for the Turbonomic "Market" market
- * @param {Object} body Body of the request (optional)
+ * @param {Object} body Body of the request (by default, get actions for ContainerPods)
  */
-async function getActions(body = {}) {
+async function getActions(body = { relatedEntityTypes: ['ContainerSpec'] }) {
   const actionsEndpoint = `${process.env.TURBO_URL}/api/v3/markets/Market/actions`;
   const postConfig = {
     headers: {
@@ -144,7 +144,7 @@ async function getContainersFromPod(uuidList) {
   const supplychainEndpoint = `${process.env.TURBO_URL}/api/v3/supplychains`;
   try {
     const params = new URLSearchParams();
-    params.append('types', 'Container');
+    params.append('types', 'ContainerSpec');
     params.append('detail_type', 'entity');
     params.append('health', false);
     uuidList.forEach((uuid) => {
@@ -157,11 +157,11 @@ async function getContainersFromPod(uuidList) {
     });
     const mappedItems = [];
     if (!supplychains.seMap
-      || !supplychains.seMap.Container
-      || !supplychains.seMap.Container.instances) {
+      || !supplychains.seMap.ContainerSpec
+      || !supplychains.seMap.ContainerSpec.instances) {
       return [];
     }
-    for (const [key, value] of Object.entries(supplychains.seMap.Container.instances)) {
+    for (const [key, value] of Object.entries(supplychains.seMap.ContainerSpec.instances)) {
       mappedItems.push({
         uuid: key,
         displayName: value.displayName,
@@ -183,23 +183,27 @@ function correlateActions(group, actions) {
   // Object to return at the end
   const groupWithActions = {
     ...group,
-    actions: {},
+    actionsDescription: '',
+    actions: [],
   };
 
   // Loop through the containers in the group and get actions for them
   group.container_members.forEach((container) => {
     actions.filter((action) => container.uuid === action.target.uuid).forEach((action) => {
-      const actionType = action.resizeAttribute ? 'Request' : 'Limit';
-      const containerName = action.target.displayName.split('/')[1];
-      const commodity = action.risk.reasonCommodity;
-      groupWithActions.actions[`${containerName}-${actionType}-${commodity}`] = {
-        container_name: containerName,
-        action_type: actionType,
-        commodity,
-        current_value: action.current_value,
-        resizeToValue: action.resizeToValue,
-        valueUnits: action.valueUnits,
-      };
+      action.compoundActions.forEach((ca) => {
+        const { actionType } = ca;
+        const containerName = ca.target.displayName;
+        const commodity = ca.risk.reasonCommodity;
+        groupWithActions.actions.push({
+          container_name: containerName,
+          action_type: actionType,
+          commodity,
+          current_value: ca.current_value,
+          resizeToValue: ca.resizeToValue,
+          valueUnits: ca.valueUnits,
+        });
+        groupWithActions.actionsDescription = `${action.risk.subCategory}: ${action.risk.description}`;
+      });
     });
   });
 
@@ -219,18 +223,20 @@ function excludeGroupsFromResults(excludeGroups, element) {
  * Convert Turbonomicese to Kubernetese, fetching containers along the way
  * @param {Object} pod Pod to parse
  */
-async function parsePodNames(pod) {
-  const groupUUID = pod.uuid;
-  const tempParse = pod.displayName.replace('Pods By ', '').split('::');
+async function parsePodsFromGroup(group) {
+  const groupUUID = group.uuid;
+  const tempParse = group.displayName.replace(' Pods', '').split('/');
   const resourceType = tempParse[0];
-  const resourceName = tempParse[1].split(' [')[0];
-  const kubeCluster = tempParse[1].split(' [')[1].replace(']', '');
+  const resourceNamespace = tempParse[1];
+  const resourceName = tempParse[2];
+  const kubeCluster = group.source.displayName;
 
-  const containerMembers = await getContainersFromPod(pod.memberUuidList);
+  const containerMembers = await getContainersFromPod(group.memberUuidList);
   return {
     group_uuid: groupUUID,
     resource_type: resourceType,
     resource_name: resourceName,
+    resource_namespace: resourceNamespace,
     cluster: kubeCluster,
     container_members: containerMembers,
   };
@@ -246,32 +252,31 @@ async function getContainersAndActions() {
   // What to query the search endpoint for in order to retrieve a list of pod groups
   const podSearchQuery = JSON.parse(process.env.POD_SEARCH_QUERY);
 
-  // What to query the actions endpoint for
-  const actionsQuery = process.env.POD_ACTIONS_QUERY;
-
   // Groups to exclude from search:
   const excludeGroups = JSON.parse(process.env.POD_GROUPS_TO_EXCLUDE);
 
   // Fetch actions from the Turbonomic API
-  const actions = await getActions(actionsQuery);
+  const actions = await getActions();
 
   // Fetch pod groups from the Turbonomic API
   const podGroups = await search(podSearchQuery, excludeGroupsFromResults.bind(null, excludeGroups));
 
   // Parse each pod group
-  const results = [];
+  const parsedGroups = [];
   const simultaneousRequestLimit = 25;
-  await asyncPool(simultaneousRequestLimit, podGroups, async (pod) => {
-    results.push(await parsePodNames(pod));
+  await asyncPool(simultaneousRequestLimit, podGroups, async (group) => {
+    parsedGroups.push(await parsePodsFromGroup(group));
   });
 
   // Combine pod groups with their actions
-  results.forEach((group, idx) => {
-    results[idx] = correlateActions(group, actions);
+  parsedGroups.forEach((group, idx) => {
+    parsedGroups[idx] = correlateActions(group, actions);
   });
 
+  const results = parsedGroups.filter((x) => x.actions.length > 0);
+
   fs.writeFileSync(
-    (process.env.OUTPUT_FILENAME && process.env.OUTPUT_FILENAME !== '') ? process.env.OUTPUT_FILENAME : 'pod_groups.json',
+    (process.env.OUTPUT_FILENAME && process.env.OUTPUT_FILENAME !== '') ? process.env.OUTPUT_FILENAME : 'container-actions.json',
     JSON.stringify(results, null, 2),
   );
 }
@@ -281,7 +286,7 @@ async function getContainersAndActions() {
  */
 function checkEnvironmentVariables() {
   const requiredVariables = [
-    'TURBO_USERNAME', 'TURBO_PASSWORD', 'TURBO_URL', 'POD_SEARCH_QUERY', 'POD_ACTIONS_QUERY', 'POD_GROUPS_TO_EXCLUDE',
+    'TURBO_USERNAME', 'TURBO_PASSWORD', 'TURBO_URL', 'POD_SEARCH_QUERY', 'POD_GROUPS_TO_EXCLUDE',
   ];
   const missingVariables = requiredVariables.filter((v) => !process.env[v]);
   if (missingVariables.length > 0) {
@@ -293,13 +298,6 @@ function checkEnvironmentVariables() {
     JSON.parse(process.env.POD_SEARCH_QUERY);
   } catch (err) {
     console.error('Error - POD_SEARCH_QUERY should be a valid JSON string.');
-    process.exit(1);
-  }
-
-  try {
-    JSON.parse(process.env.POD_ACTIONS_QUERY);
-  } catch (err) {
-    console.error('Error - POD_ACTIONS_QUERY should be a valid JSON string.');
     process.exit(1);
   }
 
